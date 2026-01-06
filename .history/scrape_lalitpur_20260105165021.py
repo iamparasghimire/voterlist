@@ -1,0 +1,187 @@
+from playwright.sync_api import sync_playwright
+import pandas as pd
+import time
+import os
+
+# Configuration
+STATE_ID = "3" # Bagmati
+DISTRICT_ID = "28" # Lalitpur
+OUTPUT_DIR = "data"
+
+def scrape_polling_centre(page, mun_name, ward_name, center_name):
+    print(f"Scraping: {mun_name} - Ward {ward_name} - {center_name}")
+    
+    # Click Submit
+    submit_btn = page.query_selector("button.btn-success")
+    if not submit_btn:
+        submit_btn = page.query_selector("input[type='submit']")
+    
+    if not submit_btn:
+        print("Submit button not found!")
+        return []
+
+    submit_btn.click()
+    
+    # Wait for table
+    try:
+        page.wait_for_selector("table#tbl_data", timeout=10000)
+    except:
+        print("Table not found (timeout). Maybe no data?")
+        return []
+
+    # Select 100 entries
+    try:
+        page.select_option("select[name='tbl_data_length']", value="100")
+        page.wait_for_timeout(2000) # Wait for reload
+    except:
+        print("Could not select 100 entries.")
+
+    all_data = []
+    page_num = 1
+    
+    while True:
+        # Scrape rows
+        rows = page.query_selector_all("tbody tr")
+        print(f"  Page {page_num}: Found {len(rows)} rows.")
+        
+        for row in rows:
+            cells = [td.inner_text() for td in row.query_selector_all("td")]
+            # Add metadata
+            if len(cells) >= 8: # Ensure valid row
+                # Columns: Serial, ID, Name, Age, Gender, Spouse, Parent, Link
+                # We want to keep relevant data and add location info
+                record = {
+                    "Municipality": mun_name,
+                    "Ward": ward_name,
+                    "Polling Centre": center_name,
+                    "Voter ID": cells[2],
+                    "Name": cells[3],
+                    "Age": cells[4],
+                    "Gender": cells[5],
+                    "Spouse Name": cells[6],
+                    "Parent Name": cells[7]
+                }
+                all_data.append(record)
+        
+        # Check for Next button
+        next_btn = page.query_selector("#tbl_data_next")
+        if next_btn and "paginate_enabled_next" in next_btn.get_attribute("class"):
+            # Get first voter ID to check for change
+            first_id_before = rows[0].query_selector("td:nth-child(3)").inner_text() if rows else ""
+            
+            next_btn.click()
+            page_num += 1
+            
+            # Wait for table update
+            # Simple wait for now, can be improved
+            page.wait_for_timeout(2000)
+            
+            # Verify update (optional but good)
+            # new_rows = page.query_selector_all("tbody tr")
+            # if new_rows and new_rows[0].query_selector("td:nth-child(3)").inner_text() == first_id_before:
+            #     print("  Warning: Page did not seem to update.")
+        else:
+            break
+            
+    return all_data
+
+def run():
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context()
+        page = context.new_page()
+        
+        print("Navigating to https://voterlist.election.gov.np/ ...")
+        page.goto("https://voterlist.election.gov.np/", timeout=60000)
+        
+        # Select State
+        print("Selecting State 3...")
+        page.select_option("select#state", value=STATE_ID)
+        page.wait_for_timeout(2000)
+        
+        # Select District
+        print("Selecting District 28 (Lalitpur)...")
+        page.select_option("select#district", value=DISTRICT_ID)
+        page.wait_for_timeout(2000)
+        
+        # Get Municipalities
+        mun_select = page.query_selector("select#vdc_mun")
+        mun_options = mun_select.query_selector_all("option")
+        # Skip first (placeholder)
+        muns = []
+        for opt in mun_options:
+            val = opt.get_attribute("value")
+            text = opt.inner_text()
+            if val:
+                muns.append((val, text))
+        
+        print(f"Found {len(muns)} municipalities.")
+        
+        for mun_val, mun_text in muns:
+            print(f"\nProcessing Municipality: {mun_text}")
+            mun_data = []
+            
+            # Select Municipality
+            page.select_option("select#vdc_mun", value=mun_val)
+            page.wait_for_timeout(2000)
+            
+            # Get Wards
+            ward_select = page.query_selector("select#ward")
+            ward_options = ward_select.query_selector_all("option")
+            wards = []
+            for opt in ward_options:
+                val = opt.get_attribute("value")
+                text = opt.inner_text()
+                if val:
+                    wards.append((val, text))
+            
+            print(f"  Found {len(wards)} wards.")
+            
+            for ward_val, ward_text in wards:
+                # Select Ward
+                page.select_option("select#ward", value=ward_val)
+                page.wait_for_timeout(2000)
+                
+                # Get Polling Centres
+                center_select = page.query_selector("select#reg_centre")
+                center_options = center_select.query_selector_all("option")
+                centers = []
+                for opt in center_options:
+                    val = opt.get_attribute("value")
+                    text = opt.inner_text()
+                    if val:
+                        centers.append((val, text))
+                
+                print(f"  Ward {ward_text}: Found {len(centers)} polling centres.")
+                
+                for center_val, center_text in centers:
+                    # Select Polling Centre
+                    page.select_option("select#reg_centre", value=center_val)
+                    
+                    # Scrape
+                    data = scrape_polling_centre(page, mun_text, ward_text, center_text)
+                    mun_data.extend(data)
+                    
+                    # Go back/Reset? 
+                    # The form is still there, we just need to re-select if the page reloaded.
+                    # But wait, submitting the form might reload the page or just update the table.
+                    # Based on test_scrape, the URL didn't change, it seems to be AJAX or same page.
+                    # But to be safe, we should ensure the dropdowns are still valid.
+                    # If the page structure is static, we are fine.
+                    
+            # Save Municipality Data
+            if mun_data:
+                df = pd.DataFrame(mun_data)
+                filename = f"{OUTPUT_DIR}/{mun_text.replace('/', '_')}.xlsx"
+                df.to_excel(filename, index=False)
+                print(f"Saved {len(mun_data)} records to {filename}")
+            else:
+                print(f"No data found for {mun_text}")
+
+        browser.close()
+
+if __name__ == "__main__":
+    run()
